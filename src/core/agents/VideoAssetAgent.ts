@@ -3,9 +3,10 @@ import path from 'path';
 import { BaseAgent } from './BaseAgent.js';
 import { AgentId, VideoAssetData, WorkflowJob } from '../../types.js';
 import { generateImageBase64 } from '../gemini.js';
-import { config } from '../config.js';
+import { config, logInfo, logWarn } from '../config.js';
 import { memory } from '../memory.js';
-import { ffmpegService } from '../ffmpeg.js';
+import { FFmpegService } from '../ffmpeg.js';
+import { VisualSynthesizer } from '../visualSynthesis.js';
 
 export class VideoAssetAgent extends BaseAgent {
   public readonly id: AgentId = 'video_asset';
@@ -55,55 +56,86 @@ export class VideoAssetAgent extends BaseAgent {
       const progressPct = 20 + Math.round(((i + 1) / totalScenes) * 65);
       this.updateProgress(job.id, progressPct, `Processing Scene ${scene.sceneNumber}/${totalScenes} visuals...`);
 
+      let assetFilePath = '';
+      let assetType: VideoAssetData['assets'][0]['type'] = 'rendered_canvas';
+      let assetProvenance = '';
+      let assetPrompt: string | undefined = undefined;
+
       // 1. Check if user provided clips match or exist for user_clips/hybrid mode
       if ((sourcePreference === 'user_clips' || sourcePreference === 'hybrid') && availableClips.length > 0) {
         const selectedClip = availableClips[i % availableClips.length];
-        this.log(job.id, `Scene ${scene.sceneNumber}: Assigned user gameplay footage (${path.basename(selectedClip)})`);
-        assetList.push({
-          sceneNumber: scene.sceneNumber,
-          filePath: selectedClip,
-          type: 'gameplay_clip',
-          provenance: `User Gameplay Footage (${path.basename(selectedClip)})`,
-        });
-        continue;
+        const clipValidation = await FFmpegService.validateMediaAsset(selectedClip);
+        if (clipValidation.isValid) {
+          assetFilePath = selectedClip;
+          assetType = 'gameplay_clip';
+          assetProvenance = `User Gameplay Footage (${path.basename(selectedClip)})`;
+        }
       }
 
-      // 2. Try Gemini Image Generation
-      const imagePrompt = `Epic cinematic screenshot of ${game}, ${scene.visualPrompt}, 4K ultra-detailed gaming render, raytraced lighting, clean dynamic composition`;
-      const base64Img = await generateImageBase64(imagePrompt, isShorts ? '9:16' : '16:9');
+      // 2. Try Gemini Image Generation if no clip assigned
+      if (!assetFilePath && (sourcePreference === 'ai_art' || sourcePreference === 'hybrid')) {
+        const imagePrompt = `Epic cinematic screenshot of ${game}, ${scene.visualPrompt}, 4K ultra-detailed gaming render, raytraced lighting, clean dynamic composition`;
+        assetPrompt = imagePrompt;
+        try {
+          const rawBase64 = await generateImageBase64(imagePrompt, isShorts ? '9:16' : '16:9');
+          if (rawBase64) {
+            const cleanBase64 = rawBase64.replace(/^data:image\/[a-z0-9.+_-]+;base64,/, '');
+            const imageFilePath = path.join(assetsDir, `scene_${scene.sceneNumber}_ai.png`);
+            fs.writeFileSync(imageFilePath, Buffer.from(cleanBase64, 'base64'));
 
-      if (base64Img) {
-        const imageFilePath = path.join(assetsDir, `scene_${scene.sceneNumber}_ai.png`);
-        fs.writeFileSync(imageFilePath, Buffer.from(base64Img, 'base64'));
-        this.log(job.id, `Scene ${scene.sceneNumber}: Rendered AI visual concept for [${game}]`);
-        assetList.push({
-          sceneNumber: scene.sceneNumber,
-          filePath: imageFilePath,
-          type: 'ai_image',
-          provenance: 'Gemini Image Generation',
-          prompt: imagePrompt,
-        });
-      } else {
-        // 3. Fallback: Procedural High-Quality Game Frame Canvas synthesized with FFmpeg
-        const canvasFilePath = path.join(assetsDir, `scene_${scene.sceneNumber}_canvas.png`);
-        await ffmpegService.createSceneFrame({
+            const validation = await FFmpegService.validateMediaAsset(imageFilePath);
+            if (validation.isValid) {
+              assetFilePath = imageFilePath;
+              assetType = 'ai_image';
+              assetProvenance = 'Gemini Image Generation';
+            } else {
+              logWarn('VideoAssetAgent', `AI image validation failed: ${validation.error}. Falling back to VisualSynthesizer.`);
+            }
+          }
+        } catch (genErr: any) {
+          logWarn('VideoAssetAgent', `Image generation skipped: ${genErr.message}`);
+        }
+      }
+
+      // 3. High-Fidelity Procedural & Dynamic Game Visual Engine
+      if (!assetFilePath) {
+        const canvasFilePath = path.join(assetsDir, `scene_${scene.sceneNumber}_visual.png`);
+        await VisualSynthesizer.generateGameSceneVisual({
           outputPath: canvasFilePath,
-          gameTitle: game,
+          game,
           sceneNumber: scene.sceneNumber,
-          headline: scene.subtitleText || `SCENE ${scene.sceneNumber}`,
-          subText: `${game.toUpperCase()} • 4K ULTRA HD`,
+          totalScenes,
+          visualPrompt: scene.visualPrompt,
+          actionDescription: scene.actionDescription || scene.subtitleText,
+          subtitleText: scene.subtitleText,
           isShorts,
-          sceneIndex: i,
         });
 
-        this.log(job.id, `Scene ${scene.sceneNumber}: Composited high-impact ${game} visual frame`);
-        assetList.push({
-          sceneNumber: scene.sceneNumber,
-          filePath: canvasFilePath,
-          type: 'rendered_canvas',
-          provenance: `Procedural ${game} Frame Compositor`,
-        });
+        assetFilePath = canvasFilePath;
+        assetType = 'rendered_canvas';
+        assetProvenance = `VisualSynthesizer ${game} Dynamic Canvas Engine`;
       }
+
+      // Validate the asset
+      const validation = await FFmpegService.validateMediaAsset(assetFilePath);
+
+      logInfo(
+        'VideoAssetAgent',
+        `Asset Validation: SCENE #${scene.sceneNumber} | Exists: ${validation.exists} | Size: ${validation.sizeBytes}B | Type: ${validation.mediaType} | Dim: ${validation.dimensions.width}x${validation.dimensions.height} | Decode: ${validation.decodeValid ? 'PASSED' : 'FAILED'} | Valid: ${validation.isValid ? 'YES' : 'NO'}`
+      );
+
+      this.log(
+        job.id,
+        `Scene ${scene.sceneNumber}: Validated visual asset (${validation.mediaType}, ${validation.dimensions.width}x${validation.dimensions.height}, ${(validation.sizeBytes / 1024).toFixed(1)} KB)`
+      );
+
+      assetList.push({
+        sceneNumber: scene.sceneNumber,
+        filePath: assetFilePath,
+        type: assetType,
+        provenance: assetProvenance,
+        prompt: assetPrompt,
+      });
     }
 
     const assetData: VideoAssetData = {
@@ -123,3 +155,4 @@ export class VideoAssetAgent extends BaseAgent {
     return assetData;
   }
 }
+

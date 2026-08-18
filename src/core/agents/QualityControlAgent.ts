@@ -21,7 +21,7 @@ export class QualityControlAgent extends BaseAgent {
     const scriptArtifact = job.artifacts.script;
     const assetsArtifact = job.artifacts.assets;
 
-    // 1. Video Integrity Check
+    // 1. Video Container & Bitrate Check
     if (videoArtifact && fs.existsSync(videoArtifact.videoFilePath)) {
       const probe = await FFmpegService.validateVideo(videoArtifact.videoFilePath);
       if (probe.isValid) {
@@ -43,6 +43,30 @@ export class QualityControlAgent extends BaseAgent {
           details: probe.error || 'Video file failed integrity probe.',
         });
       }
+
+      // 1b. Video Visual Content & Blank Screen Frame-Sampling Audit
+      const visualAudit = await FFmpegService.validateVideoVisuals(videoArtifact.videoFilePath);
+      if (visualAudit.isValid && !visualAudit.isBlank) {
+        checks.push({
+          id: 'qc_visual_content',
+          name: 'Visual Content & Dynamic Scene Variety',
+          category: 'video',
+          status: 'passed',
+          score: 95,
+          details: `Frame sampling verified across ${visualAudit.samples.length} checkpoints. Visual variety index: ${visualAudit.avgVariance.toFixed(1)}/100 (0 solid blank frames).`,
+        });
+      } else {
+        // HARD FAILURE: Blank / flat / solid placeholder detected
+        checks.push({
+          id: 'qc_visual_content',
+          name: 'Visual Content & Dynamic Scene Variety',
+          category: 'video',
+          status: 'failed',
+          score: 0,
+          details: `CRITICAL VISUAL FAILURE: Video contains flat/blank/solid placeholder frames. ${visualAudit.details}`,
+        });
+        recommendations.push('Hard Failure: Generated video contains blank or solid placeholder frames. Re-run visual generation pipeline with verified game graphics.');
+      }
     } else {
       checks.push({
         id: 'qc_video_container',
@@ -51,6 +75,14 @@ export class QualityControlAgent extends BaseAgent {
         status: 'failed',
         score: 0,
         details: 'Video file missing from output directory.',
+      });
+      checks.push({
+        id: 'qc_visual_content',
+        name: 'Visual Content & Dynamic Scene Variety',
+        category: 'video',
+        status: 'failed',
+        score: 0,
+        details: 'Video file missing; visual content check could not be executed.',
       });
     }
 

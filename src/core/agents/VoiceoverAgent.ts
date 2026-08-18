@@ -32,9 +32,9 @@ export class VoiceoverAgent extends BaseAgent {
 
     // 1. Try Gemini TTS
     let audioBuffer = await generateSpeechAudio(fullScriptText, voice);
+    let audioSuccess = false;
 
     if (audioBuffer && audioBuffer.length > 100) {
-      // Gemini TTS provides raw PCM / WAV / AAC
       const tempPcmPath = path.join(audioDir, `${job.id}_raw.pcm`);
       fs.writeFileSync(tempPcmPath, audioBuffer);
 
@@ -43,14 +43,26 @@ export class VoiceoverAgent extends BaseAgent {
         const { exec } = await import('child_process');
         const { promisify } = await import('util');
         const execAsync = promisify(exec);
-        await execAsync(`ffmpeg -y -i "${tempPcmPath}" -c:a aac -b:a 192k "${masterAudioPath}"`);
-        this.log(job.id, `Gemini TTS speech generated and encoded to AAC (${audioBuffer.length} bytes)`, 'success');
+        
+        // Detect if buffer has RIFF header (WAV) or raw 24kHz s16le PCM
+        const isWav = audioBuffer.length > 4 && audioBuffer.toString('utf8', 0, 4) === 'RIFF';
+        const ffmpegCmd = isWav
+          ? `ffmpeg -y -i "${tempPcmPath}" -c:a aac -b:a 192k "${masterAudioPath}"`
+          : `ffmpeg -y -f s16le -ar 24000 -ac 1 -i "${tempPcmPath}" -c:a aac -b:a 192k "${masterAudioPath}"`;
+
+        await execAsync(ffmpegCmd);
+        if (fs.existsSync(masterAudioPath) && fs.statSync(masterAudioPath).size > 1000) {
+          audioSuccess = true;
+          this.log(job.id, `Gemini TTS speech generated and encoded to AAC (${audioBuffer.length} bytes)`, 'success');
+        }
       } catch (convErr: any) {
-        fs.writeFileSync(masterAudioPath, audioBuffer);
+        this.log(job.id, `TTS conversion warning: ${convErr.message}. Falling back to synthesized audio.`, 'warn');
       }
-    } else {
+    }
+
+    if (!audioSuccess) {
       // 2. Synthesized audio track fallback
-      this.log(job.id, 'Gemini TTS unavailable or returned empty. Synthesizing audio voice track...', 'warn');
+      this.log(job.id, 'Synthesizing clean voiceover audio track...', 'info');
       const totalSec = script.totalDurationSeconds || 25;
       await FFmpegService.generateSyntheticVoiceover(totalSec, masterAudioPath);
     }

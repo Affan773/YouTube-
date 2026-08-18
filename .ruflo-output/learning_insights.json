@@ -1,0 +1,59 @@
+[
+  {
+    "id": "ins_1787075766323_heoq",
+    "timestamp": 1787075766323,
+    "game": "Minecraft",
+    "format": "shorts",
+    "topic": "Create a Minecraft gaming Short about 5 secret survival builds",
+    "insight": "Loopable ending structures leverage the Shorts algorithm's tendency to count repeat views, artificially inflating retention percentages beyond 100%.",
+    "retentionImpact": "+26% vs baseline"
+  },
+  {
+    "id": "ins_1787075766323_k7pw",
+    "timestamp": 1787075766323,
+    "game": "Minecraft",
+    "format": "shorts",
+    "topic": "Create a Minecraft gaming Short about 5 secret survival builds",
+    "insight": "High-density visual layouts prevent information fatigue by keeping the viewer's eyes scanning the entire frame, increasing average view duration.",
+    "retentionImpact": "+26% vs baseline"
+  },
+  {
+    "id": "ins_1787075766323_f3rm",
+    "timestamp": 1787075766323,
+    "game": "Minecraft",
+    "format": "shorts",
+    "topic": "Create a Minecraft gaming Short about 5 secret survival builds",
+    "insight": "Negative-constraint hooks ('Stop building') create an immediate psychological barrier that forces viewers to stay to identify the 'correct' method.",
+    "retentionImpact": "+26% vs baseline"
+  },
+  {
+    "id": "ins_1",
+    "timestamp": 1786815972079,
+    "game": "Minecraft",
+    "contentType": "secrets",
+    "format": "shorts",
+    "hookType": "Pattern Interruption",
+    "insight": "Revealing a counter-intuitive game mechanic within the first 1.5 seconds increased 10-second retention by 38%.",
+    "retentionImpact": "+38% viewer hold"
+  },
+  {
+    "id": "ins_2",
+    "timestamp": 1786902372079,
+    "game": "GTA 5",
+    "contentType": "challenges",
+    "format": "shorts",
+    "hookType": "High-Stakes Countdown",
+    "insight": "Immediate siren SFX coupled with fast dynamic zoom on the police radar boosted watch-through rate past 82%.",
+    "retentionImpact": "+82% completion"
+  },
+  {
+    "id": "ins_3",
+    "timestamp": 1786988772079,
+    "game": "Roblox",
+    "contentType": "funny_moments",
+    "format": "shorts",
+    "hookType": "Relatable Fail",
+    "insight": "Subtitles formatted with 2-word burst animations and high color contrast increased comment engagement 4.2x.",
+    "retentionImpact": "4.2x engagement rate"
+  }
+]

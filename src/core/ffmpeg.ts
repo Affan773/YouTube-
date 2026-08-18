@@ -4,6 +4,7 @@ import path from 'path';
 import { promisify } from 'util';
 import { config, logInfo, logWarn, logError } from './config.js';
 import { VideoFormat } from '../types.js';
+import { VisualSynthesizer } from './visualSynthesis.js';
 
 const execAsync = promisify(exec);
 
@@ -22,6 +23,29 @@ export interface FFmpegRenderOptions {
   voiceoverAudioPath?: string;
   outputPath: string;
   subtitlesSrtPath?: string;
+}
+
+export interface MediaAssetValidation {
+  exists: boolean;
+  sizeBytes: number;
+  mediaType: string;
+  dimensions: { width: number; height: number };
+  decodeValid: boolean;
+  isValid: boolean;
+  error?: string;
+}
+
+export interface VisualValidationResult {
+  isValid: boolean;
+  isBlank: boolean;
+  avgVariance: number;
+  samples: {
+    timestampSec: number;
+    variance: number;
+    meanBrightness: number;
+    isSolid: boolean;
+  }[];
+  details: string;
 }
 
 export class FFmpegService {
@@ -64,6 +88,160 @@ export class FFmpegService {
       return { primary: '0x991B1B', accent: '0xDC2626', darkBg: '0x000000' }; // Horror Blood Crimson
     }
     return { primary: '0x6366F1', accent: '0x38BDF8', darkBg: '0x0B0F19' }; // Universal Neon Indigo
+  }
+
+  /**
+   * Validate an individual media asset (image or video) before rendering
+   */
+  public static async validateMediaAsset(filePath?: string): Promise<MediaAssetValidation> {
+    if (!filePath || !fs.existsSync(filePath)) {
+      return {
+        exists: false,
+        sizeBytes: 0,
+        mediaType: 'unknown',
+        dimensions: { width: 0, height: 0 },
+        decodeValid: false,
+        isValid: false,
+        error: 'File does not exist on disk',
+      };
+    }
+
+    try {
+      const stats = fs.statSync(filePath);
+      const ext = path.extname(filePath).toLowerCase();
+      let mediaType = 'unknown';
+
+      if (['.png', '.jpg', '.jpeg', '.webp'].includes(ext)) {
+        mediaType = ext === '.jpg' ? 'image/jpeg' : `image/${ext.slice(1)}`;
+      } else if (['.mp4', '.mov', '.webm', '.mkv'].includes(ext)) {
+        mediaType = `video/${ext.slice(1)}`;
+      }
+
+      if (stats.size < 500) {
+        return {
+          exists: true,
+          sizeBytes: stats.size,
+          mediaType,
+          dimensions: { width: 0, height: 0 },
+          decodeValid: false,
+          isValid: false,
+          error: `File size is too small (${stats.size} bytes)`,
+        };
+      }
+
+      // Probe stream info
+      const { stdout } = await execAsync(
+        `ffprobe -v error -select_streams v:0 -show_entries stream=width,height,codec_name -of json "${filePath}"`
+      );
+      const probe = JSON.parse(stdout || '{}');
+      const stream = probe.streams?.[0];
+
+      const width = stream?.width || 0;
+      const height = stream?.height || 0;
+
+      // Decode single frame test
+      await execAsync(`ffmpeg -v error -i "${filePath}" -vframes 1 -f null -`);
+
+      const isValid = width > 0 && height > 0;
+      return {
+        exists: true,
+        sizeBytes: stats.size,
+        mediaType,
+        dimensions: { width, height },
+        decodeValid: true,
+        isValid,
+        error: isValid ? undefined : 'Invalid visual stream dimensions',
+      };
+    } catch (err: any) {
+      return {
+        exists: true,
+        sizeBytes: 0,
+        mediaType: 'unknown',
+        dimensions: { width: 0, height: 0 },
+        decodeValid: false,
+        isValid: false,
+        error: `Decode test failed: ${err.message}`,
+      };
+    }
+  }
+
+  /**
+   * Frame-sampling visual validator to detect blank/solid frames or placeholder-only output
+   */
+  public static async validateVideoVisuals(videoPath: string): Promise<VisualValidationResult> {
+    if (!fs.existsSync(videoPath)) {
+      return {
+        isValid: false,
+        isBlank: true,
+        avgVariance: 0,
+        samples: [],
+        details: 'Video file missing from disk',
+      };
+    }
+
+    try {
+      const { stdout: durOut } = await execAsync(
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`
+      );
+      const duration = parseFloat(durOut.trim()) || 10;
+      const samplePoints = [0.15, 0.35, 0.55, 0.75, 0.9];
+      const samples: VisualValidationResult['samples'] = [];
+
+      for (const pct of samplePoints) {
+        const timeSec = Math.max(0.5, Math.min(duration - 0.5, duration * pct));
+        try {
+          const raw = await execAsync(
+            `ffmpeg -v error -ss ${timeSec.toFixed(2)} -i "${videoPath}" -vframes 1 -vf "scale=64:64" -f rawvideo -pix_fmt gray -`,
+            { encoding: 'buffer', maxBuffer: 10 * 1024 * 1024 }
+          );
+          const buf = raw.stdout;
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) sum += buf[i];
+          const mean = sum / (buf.length || 1);
+          let sqDiff = 0;
+          for (let i = 0; i < buf.length; i++) sqDiff += Math.pow(buf[i] - mean, 2);
+          const stdDev = Math.sqrt(sqDiff / (buf.length || 1));
+          const isSolid = stdDev < 12.0;
+
+          samples.push({
+            timestampSec: timeSec,
+            variance: stdDev,
+            meanBrightness: mean,
+            isSolid,
+          });
+        } catch (sampleErr: any) {
+          logWarn('FFmpegVisuals', `Sample frame at ${timeSec.toFixed(1)}s probe error: ${sampleErr.message}`);
+        }
+      }
+
+      const avgVariance = samples.length > 0
+        ? samples.reduce((acc, s) => acc + s.variance, 0) / samples.length
+        : 0;
+
+      const solidFramesCount = samples.filter((s) => s.isSolid).length;
+      const isBlank = avgVariance < 16.0 || (samples.length > 0 && solidFramesCount >= Math.ceil(samples.length / 2));
+      const isValid = !isBlank && samples.length > 0;
+
+      const details = isValid
+        ? `Visual validation passed across ${samples.length} frame samples (Average visual variance: ${avgVariance.toFixed(1)}/100, 0 solid blank frames).`
+        : `Visual validation warning: ${solidFramesCount}/${samples.length} sample frames detected as flat/solid color (Average visual variance: ${avgVariance.toFixed(1)} < 16.0).`;
+
+      return {
+        isValid,
+        isBlank,
+        avgVariance,
+        samples,
+        details,
+      };
+    } catch (err: any) {
+      return {
+        isValid: false,
+        isBlank: true,
+        avgVariance: 0,
+        samples: [],
+        details: `Visual validation error: ${err.message}`,
+      };
+    }
   }
 
   /**
@@ -154,31 +332,16 @@ export class FFmpegService {
     isShorts: boolean;
     sceneIndex: number;
   }): Promise<string> {
-    const width = options.isShorts ? 1080 : 1920;
-    const height = options.isShorts ? 1920 : 1080;
-    const colors = FFmpegService.getGameThemeColor(options.gameTitle);
-
-    const safeGame = options.gameTitle.toUpperCase().replace(/['":\\]/g, ' ').slice(0, 24);
-    const safeHeadline = (options.headline || `SCENE ${options.sceneNumber}`).toUpperCase().replace(/['":\\]/g, ' ').slice(0, 36);
-    const safeSub = options.subText.replace(/['":\\]/g, ' ').slice(0, 42);
-
-    const cmd = `ffmpeg -y -f lavfi -i "color=c=${colors.darkBg}:s=${width}x${height}:d=1" \
--filter_complex "[0:v]drawbox=x=30:y=30:w=${width - 60}:h=${height - 60}:color=${colors.primary}@0.8:t=8, \
-drawbox=x=40:y=40:w=${width - 80}:h=${options.isShorts ? 220 : 140}:color=black@0.7:t=fill, \
-drawtext=text='${safeGame}':fontcolor=${colors.accent}:fontsize=${Math.floor(width / 18)}:x=(w-text_w)/2:y=${options.isShorts ? 100 : 70}:shadowcolor=black:shadowx=3:shadowy=3, \
-drawbox=x=50:y=${Math.floor(height * 0.42)}:w=${width - 100}:h=${options.isShorts ? 360 : 260}:color=black@0.82:t=fill, \
-drawtext=text='${safeHeadline}':fontcolor=white:fontsize=${Math.floor(width / 20)}:x=(w-text_w)/2:y=${Math.floor(height * 0.46)}:shadowcolor=black:shadowx=4:shadowy=4, \
-drawtext=text='${safeSub}':fontcolor=${colors.primary}:fontsize=${Math.floor(width / 30)}:x=(w-text_w)/2:y=${Math.floor(height * 0.54)}:shadowcolor=black:shadowx=2:shadowy=2[out]" \
--map "[out]" -vframes 1 "${options.outputPath}"`;
-
-    try {
-      await execAsync(cmd);
-      return options.outputPath;
-    } catch (err: any) {
-      logWarn('FFmpeg', `Procedural scene frame error: ${err.message}`);
-      await execAsync(`ffmpeg -y -f lavfi -i "color=c=0x111827:s=${width}x${height}:d=1" -vframes 1 "${options.outputPath}"`);
-      return options.outputPath;
-    }
+    return VisualSynthesizer.generateGameSceneVisual({
+      outputPath: options.outputPath,
+      game: options.gameTitle,
+      sceneNumber: options.sceneNumber,
+      totalScenes: 5,
+      visualPrompt: options.headline,
+      actionDescription: options.subText,
+      subtitleText: options.headline,
+      isShorts: options.isShorts,
+    });
   }
 
   /**
@@ -195,6 +358,7 @@ drawtext=text='${safeSub}':fontcolor=${colors.primary}:fontsize=${Math.floor(wid
     gameTitle = ''
   ): Promise<string> {
     const isVideo = imageOrVideoPath.endsWith('.mp4') || imageOrVideoPath.endsWith('.mov') || imageOrVideoPath.endsWith('.webm');
+    const totalFrames = Math.max(25, Math.round(duration * 25));
     const safeSubtitle = subtitleText.replace(/['":\\]/g, ' ').slice(0, 60);
     const colors = FFmpegService.getGameThemeColor(gameTitle);
 
@@ -203,20 +367,20 @@ drawtext=text='${safeSub}':fontcolor=${colors.primary}:fontsize=${Math.floor(wid
       // Scale and center-crop video to exact dimensions
       filter = `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setpts=PTS-STARTPTS`;
     } else {
-      // Ken Burns dynamic zoompan effect on still image
-      const zoomExpr = sceneIndex % 2 === 0 ? 'min(zoom+0.0018,1.30)' : 'max(1.30-0.0018*on,1.0)';
-      filter = `scale=2*${width}:-1,zoompan=z='${zoomExpr}':d=${duration * 25}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}`;
+      // Scale to cover frame first, then apply high-performance Ken Burns zoompan
+      const zoomExpr = sceneIndex % 2 === 0 ? 'min(zoom+0.0012,1.20)' : 'max(1.20-0.0012*on,1.0)';
+      filter = `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},zoompan=z='${zoomExpr}':d=${totalFrames}:fps=25:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}`;
     }
 
     // Add glowing kinetic subtitle banner at bottom
     if (safeSubtitle) {
       const fontSize = Math.floor(width / 24);
-      filter += `,drawbox=y=ih-${Math.floor(height * 0.24)}:h=${Math.floor(height * 0.16)}:color=black@0.72:t=fill,drawtext=text='${safeSubtitle}':fontcolor=${colors.accent}:fontsize=${fontSize}:x=(w-text_w)/2:y=h-${Math.floor(height * 0.16)}:shadowcolor=black:shadowx=4:shadowy=4`;
+      filter += `,drawbox=x=60:y=ih-${Math.floor(height * 0.16)}:w=iw-120:h=${Math.floor(height * 0.09)}:color=black@0.65:t=fill,drawtext=text='${safeSubtitle}':fontcolor=${colors.accent}:fontsize=${fontSize}:x=(w-text_w)/2:y=h-${Math.floor(height * 0.11)}:shadowcolor=black:shadowx=3:shadowy=3`;
     }
 
     const cmd = isVideo
-      ? `ffmpeg -y -ss 0 -t ${duration} -i "${imageOrVideoPath}" -vf "${filter}" -c:v libx264 -pix_fmt yuv420p -r 25 -an "${outSegmentPath}"`
-      : `ffmpeg -y -loop 1 -t ${duration} -i "${imageOrVideoPath}" -vf "${filter}" -c:v libx264 -pix_fmt yuv420p -r 25 -an "${outSegmentPath}"`;
+      ? `ffmpeg -y -ss 0 -t ${duration} -i "${imageOrVideoPath}" -vf "${filter}" -c:v libx264 -preset ultrafast -pix_fmt yuv420p -r 25 -an "${outSegmentPath}"`
+      : `ffmpeg -y -i "${imageOrVideoPath}" -vf "${filter}" -c:v libx264 -preset ultrafast -pix_fmt yuv420p -frames:v ${totalFrames} -an "${outSegmentPath}"`;
 
     await execAsync(cmd);
     return outSegmentPath;
@@ -250,24 +414,19 @@ drawtext=text='${safeSub}':fontcolor=${colors.primary}:fontsize=${Math.floor(wid
 
       let visualSource = scene.videoPath || scene.imagePath;
       if (!visualSource || !fs.existsSync(visualSource)) {
-        // Fallback visual slide
-        const fallbackImg = path.join(tempDir, `fallback_slide_${i}.png`);
-        const colors = FFmpegService.getGameThemeColor(game);
-        const safeTitle = `${(game || 'GAMING').toUpperCase()} • SCENE ${i + 1}`;
-        const safeSubtitle = scene.subtitleText || 'Pro Gameplay Highlights';
-
-        const slideCmd = `ffmpeg -y -f lavfi -i "color=c=${colors.darkBg}:s=${width}x${height}:d=1" \
--filter_complex "[0:v]drawbox=x=40:y=40:w=${width - 80}:h=${height - 80}:color=${colors.primary}@0.85:t=8, \
-drawtext=text='${safeTitle}':fontcolor=white:fontsize=${Math.floor(width / 22)}:x=(w-text_w)/2:y=(h-text_h)/2-50:shadowcolor=black:shadowx=3:shadowy=3, \
-drawtext=text='${safeSubtitle}':fontcolor=${colors.accent}:fontsize=${Math.floor(width / 32)}:x=(w-text_w)/2:y=(h-text_h)/2+50:shadowcolor=black:shadowx=2:shadowy=2[out]" \
--map "[out]" -vframes 1 "${fallbackImg}"`;
-
-        try {
-          await execAsync(slideCmd);
-          visualSource = fallbackImg;
-        } catch {
-          visualSource = '';
-        }
+        // Fallback to rich dynamic procedural visual synthesis
+        const fallbackImg = path.join(tempDir, `visual_scene_${i + 1}.png`);
+        await VisualSynthesizer.generateGameSceneVisual({
+          outputPath: fallbackImg,
+          game: game || 'Gaming',
+          sceneNumber: scene.sceneNumber,
+          totalScenes: scenes.length,
+          visualPrompt: scene.subtitleText || `SCENE ${scene.sceneNumber}`,
+          actionDescription: `Pro Gameplay Scene ${scene.sceneNumber}`,
+          subtitleText: scene.subtitleText || '',
+          isShorts: format === 'shorts',
+        });
+        visualSource = fallbackImg;
       }
 
       await FFmpegService.renderSceneSegment(
@@ -339,6 +498,11 @@ drawtext=text='${safeSubtitle}':fontcolor=${colors.accent}:fontsize=${Math.floor
     const safeHeadline = (headline || 'INSANE SECRET REVEALED').toUpperCase().replace(/['":\\]/g, ' ').slice(0, 30);
     const safeSub = (subText || (gameTitle ? `${gameTitle.toUpperCase()} TRICKS` : 'PRO SECRETS')).toUpperCase().replace(/['":\\]/g, ' ').slice(0, 35);
 
+    const outDir = path.dirname(outputPath);
+    if (!fs.existsSync(outDir)) {
+      fs.mkdirSync(outDir, { recursive: true });
+    }
+
     let baseInput = '';
     if (baseImagePath && fs.existsSync(baseImagePath)) {
       baseInput = `-i "${baseImagePath}"`;
@@ -350,9 +514,9 @@ drawtext=text='${safeSubtitle}':fontcolor=${colors.accent}:fontsize=${Math.floor
 -filter_complex "[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}, \
 drawbox=x=0:y=0:w=${width}:h=${height}:color=black@0.25:t=fill, \
 drawbox=x=30:y=30:w=${width - 60}:h=${height - 60}:color=${colors.primary}@0.85:t=10, \
-drawbox=x=40:y=h-240:w=w-80:h=190:color=black@0.8:t=fill, \
-drawtext=text='${safeHeadline}':fontcolor=${colors.accent}:fontsize=74:x=(w-text_w)/2:y=h-210:shadowcolor=black:shadowx=5:shadowy=5, \
-drawtext=text='${safeSub}':fontcolor=white:fontsize=46:x=(w-text_w)/2:y=h-100:shadowcolor=black:shadowx=4:shadowy=4[out]" \
+drawbox=x=40:y=${height - 240}:w=${width - 80}:h=190:color=black@0.8:t=fill, \
+drawtext=text='${safeHeadline}':fontcolor=${colors.accent}:fontsize=74:x=(w-text_w)/2:y=${height - 210}:shadowcolor=black:shadowx=5:shadowy=5, \
+drawtext=text='${safeSub}':fontcolor=white:fontsize=46:x=(w-text_w)/2:y=${height - 100}:shadowcolor=black:shadowx=4:shadowy=4[out]" \
 -map "[out]" -vframes 1 "${outputPath}"`;
 
     try {

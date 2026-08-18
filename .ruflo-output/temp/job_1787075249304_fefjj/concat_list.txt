@@ -1,0 +1,7 @@
+file '/app/applet/.ruflo-output/temp/job_1787075249304_fefjj/segment_0.mp4'
+file '/app/applet/.ruflo-output/temp/job_1787075249304_fefjj/segment_1.mp4'
+file '/app/applet/.ruflo-output/temp/job_1787075249304_fefjj/segment_2.mp4'
+file '/app/applet/.ruflo-output/temp/job_1787075249304_fefjj/segment_3.mp4'
+file '/app/applet/.ruflo-output/temp/job_1787075249304_fefjj/segment_4.mp4'
+file '/app/applet/.ruflo-output/temp/job_1787075249304_fefjj/segment_5.mp4'
+file '/app/applet/.ruflo-output/temp/job_1787075249304_fefjj/segment_6.mp4'
