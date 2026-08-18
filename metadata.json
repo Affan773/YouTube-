@@ -1,0 +1,8 @@
+{
+  "name": "Remix Ruflo YouTube Automation Agent",
+  "description": "A multi-agent system using Gemini and FFmpeg to research, generate, edit, and publish YouTube videos from a single prompt.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
